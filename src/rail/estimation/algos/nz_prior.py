@@ -91,7 +91,12 @@ class CosmicVarianceStackInformer(PzInformer):
         The first term stands for Poisson distribution, 
         The second term account for the clustering effect. 
         """
-        return 1. + self.nz_model*(self.midpoints/amp)**gamma
+        # Ensure amp is positive and handle edge cases
+        amp_safe = np.maximum(amp, 1e-10)  # Prevent division by zero or negative amp
+        ratio = self.midpoints / amp_safe
+        # Handle negative ratios that could cause issues with fractional gamma
+        ratio = np.maximum(ratio, 1e-10)  # Ensure positive values for power operation
+        return 1. + self.nz_model * (ratio)**gamma
 
     def loss(self,vec): 
         """
@@ -234,8 +239,15 @@ class CosmicVarianceStackSummarizer(PZSummarizer):
         self.num_tot = np.trapezoid(nz, bins)
         
         # best fit var(N)/N fitted with the informer, interpolate with midpoints defined in this module
-        self.model_varN_overN = 1. + self.nz_model*(self.midpoints/self.amp)**self.gamma
-        self.model_coeff_variation = InterpolatedUnivariateSpline(self.midpoints, np.sqrt(self.model_varN_overN/self.nz_model), 
+        # Use the safe version to avoid warnings
+        amp_safe = np.maximum(self.amp, 1e-10)
+        ratio = self.midpoints / amp_safe
+        ratio = np.maximum(ratio, 1e-10)
+        self.model_varN_overN = 1. + self.nz_model * (ratio)**self.gamma
+        # Handle divide by zero in sqrt calculation
+        nz_model_safe = np.maximum(self.nz_model, 1e-10)  # Prevent division by zero
+        coeff_variation = np.sqrt(self.model_varN_overN / nz_model_safe)
+        self.model_coeff_variation = InterpolatedUnivariateSpline(self.midpoints, coeff_variation, 
                                                             ext=3, k=1)
         
         # produce stack n(z) interpolation, and evaluate at the midpoints
