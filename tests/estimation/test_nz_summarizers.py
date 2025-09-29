@@ -83,7 +83,7 @@ def test_logistic_gp_summarizer_fast():
     zmid_wx = np.linspace(0.0, 3.0, 51)
     # Mean signal resembling a broad n(z) shape
     mean_wx = np.exp(-0.5 * ((zmid_wx - 1.0) / 0.5) ** 2)
-    mean_wx /= np.trapz(mean_wx, zmid_wx)
+    mean_wx /= np.trapezoid(mean_wx, zmid_wx)
     # Small diagonal covariance to make the distribution well-conditioned
     cov_wx = np.diag(0.05 * np.ones_like(zmid_wx))
 

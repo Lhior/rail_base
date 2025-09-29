@@ -18,7 +18,7 @@ from scipy.stats import lognorm
 from scipy.interpolate import InterpolatedUnivariateSpline
 from scipy.optimize import minimize
 from scipy.stats import multivariate_normal, rv_histogram
-from scipy.integrate import simps
+from scipy.integrate import simpson
 from typing import Callable
 
 
