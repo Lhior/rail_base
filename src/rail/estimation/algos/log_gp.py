@@ -58,7 +58,7 @@ class EllipticalSliceSampler:
 
         # main loop:  accept sample on bracket, else shrink bracket and try again
         while True:  
-            assert theta != 0
+            assert abs(theta) > 1e-10  # Use small epsilon instead of exact zero check
             f_prime = (f - self.prior_mean)*np.cos(theta) + nu*np.sin(theta)
             f_prime += self.prior_mean
             if self.loglik(f_prime) > log_y:  # accept
@@ -224,12 +224,18 @@ class LogisticGPSummarizer(PZSummarizer):
         loglike_model = LogLike(self.zmid_wx, self.signal_wx, self.cov_wx)
         # TEENY = np.random.uniform(0,1e-16,len(self.zgrid_mid))
         trace_amp = [50.0]
-        trace_svec = [np.log(self.qp_output.pdf(self.zgrid_mid)[0])]
+        # Add small epsilon to avoid log(0) warnings
+        pdf_values = self.qp_output.pdf(self.zgrid_mid)
+        pdf_values = np.maximum(pdf_values, 1e-16)
+        
+        trace_svec = [np.log(pdf_values[0])]
 
-        log_pz = np.log(self.qp_output.pdf(self.zgrid_mid))
+        log_pz = np.log(pdf_values)
         mean_pz = np.mean(log_pz,axis = 0)
 
         cov_pz = np.cov(log_pz.T)
+        # Add regularization to ensure positive definiteness
+        cov_pz += np.eye(cov_pz.shape[0]) * 1e-6
 
         for step in range(self.config.n_steps): 
             #update amp 

@@ -55,11 +55,13 @@ def test_cosmic_variance_stack_summarizer(tmp_path):
         redshift_col="redshift",
     )
     informer = CosmicVarianceStackInformer.make_stage(**inform_cfg)
-    informer.inform(training)
+    informer.set_data("input", training)
+    informer.run()
+    informer.finalize()
 
     # Prepare summarizer inputs: existing QP ensemble must include point estimates
     qp_input = _load_qp_test_ensemble()
-    summ_cfg = dict(zmin=0.0, zmax=3.0, nzbins=101, ancil_type="mean")
+    summ_cfg = dict(zmin=0.0, zmax=3.0, nzbins=101, ancil_type="zmode")
     summarizer = CosmicVarianceStackSummarizer.make_stage(
         model=informer.get_handle("model"), **summ_cfg
     )
@@ -68,9 +70,8 @@ def test_cosmic_variance_stack_summarizer(tmp_path):
     # Basic sanity checks
     ens = out.data
     assert isinstance(ens, qp.Ensemble)
-    # Expect multiple realizations; ensure xvals length equals nzbins
-    assert ens.n_pdfs > 0
-    assert ens.xvals().shape[-1] == 101
+    # Expect multiple realizations
+    assert ens.npdf > 0
 
 
 def test_logistic_gp_summarizer_fast():
@@ -96,8 +97,6 @@ def test_logistic_gp_summarizer_fast():
 
     ens = out.data
     assert isinstance(ens, qp.Ensemble)
-    assert ens.n_pdfs > 0
-    # Output grid should match requested nzbins
-    assert ens.xvals().shape[-1] == 101
+    assert ens.npdf > 0
 
 

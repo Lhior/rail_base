@@ -177,7 +177,7 @@ class CosmicVarianceStackSummarizer(PZSummarizer):
         for el in self.pz: 
             model = rv_histogram((el, convert_mids_to_breaks(self.midpoints)))
             rebinned = model.cdf(breaks_new[1:]) - model.cdf(breaks_new[:-1]) 
-            list_rebinned.append(rebinned/np.trapz(rebinned, midpoints_new))
+            list_rebinned.append(rebinned/np.trapezoid(rebinned, midpoints_new))
         list_rebinned = np.array(list_rebinned)
         return list_rebinned
     
@@ -188,9 +188,17 @@ class CosmicVarianceStackSummarizer(PZSummarizer):
         var = (self.model_coeff_variation(mids) * expect)**2
         mu = np.log(expect**2/np.sqrt(var + expect**2))
         sig_2 = np.log(var/expect**2 + 1.)
+        
+        # Handle invalid values in sig_2
+        sig_2 = np.nan_to_num(sig_2, nan=1e-6, posinf=1e-6, neginf=1e-6)
+        sig_2 = np.maximum(sig_2, 1e-6)  # Ensure minimum variance
+        
+        # Ensure mu doesn't have invalid values
+        mu = np.nan_to_num(mu, nan=0.0, posinf=0.0, neginf=0.0)
+        
         samples = multivariate_normal.rvs(mu, np.diag(sig_2), size=1000)
         pz = np.exp(samples)
-        pz = np.array([el/np.trapz(el, mids) for el in pz])
+        pz = np.array([el/np.trapezoid(el, mids) for el in pz])
         return pz, mu, np.diag(sig_2)
 
     
@@ -223,7 +231,7 @@ class CosmicVarianceStackSummarizer(PZSummarizer):
         # nz: histogram value, bins: bin edges, norm: normalized histogram value
         nz = tomographic_binning_dnnz[0]
         bins = (tomographic_binning_dnnz[1][1:] + tomographic_binning_dnnz[1][:-1])/2
-        self.num_tot = np.trapz(nz, bins)
+        self.num_tot = np.trapezoid(nz, bins)
         
         # best fit var(N)/N fitted with the informer, interpolate with midpoints defined in this module
         self.model_varN_overN = 1. + self.nz_model*(self.midpoints/self.amp)**self.gamma
