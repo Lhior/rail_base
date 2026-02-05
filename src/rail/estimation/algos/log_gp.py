@@ -10,103 +10,116 @@ import numpy as np
 import qp
 from ceci.config import StageParameter as Param
 from rail.estimation.summarizer import PZSummarizer
-from rail.estimation.informer import PzInformer
-from rail.core.data import QPHandle, TableHandle, ModelHandle, Hdf5Handle
-from rail.core.common_params import SHARED_PARAMS
+from rail.core.data import QPHandle, ModelHandle
 
-from scipy.stats import lognorm
 from scipy.interpolate import InterpolatedUnivariateSpline
-from scipy.optimize import minimize
-from scipy.stats import multivariate_normal, rv_histogram
-from scipy.integrate import simpson
-from typing import Callable
+from scipy.stats import multivariate_normal
+from typing import Callable, Optional, Tuple
+from numpy.linalg import LinAlgError
+
+
+PDF_FLOOR = 1.0e-12
+
+
+def compute_bin_widths(mids: np.ndarray) -> np.ndarray:
+    mids = np.asarray(mids, dtype=float)
+    if mids.size <= 1:
+        return np.ones_like(mids)
+    edges = np.empty(mids.size + 1, dtype=float)
+    edges[1:-1] = 0.5 * (mids[:-1] + mids[1:])
+    edges[0] = mids[0] - 0.5 * (mids[1] - mids[0])
+    edges[-1] = mids[-1] + 0.5 * (mids[-1] - mids[-2])
+    return np.diff(edges)
+
+
+def pdf_to_logit(pdf: np.ndarray, widths: Optional[np.ndarray] = None) -> np.ndarray:
+    """Project a density defined on bins to simplex coordinates (Eq. 65/69 in Rau et al. 2021)."""
+    pdf = np.asarray(pdf, dtype=float)
+    if widths is None:
+        widths = np.ones_like(pdf)
+    widths = np.asarray(widths, dtype=float)
+    mass = np.clip(pdf, PDF_FLOOR, None) * widths
+    total = np.sum(mass)
+    if not np.isfinite(total) or total <= 0.0:
+        total = PDF_FLOOR * mass.size
+    simplex = mass / total
+    baseline = simplex[-1]
+    return np.log(simplex[:-1]) - np.log(baseline)
+
+
+def logit_to_pdf(logit: np.ndarray, widths: Optional[np.ndarray] = None) -> np.ndarray:
+    """Inverse logistic transform returning a density whose bin-integrals follow the simplex."""
+    logit = np.asarray(logit, dtype=float)
+    if widths is None:
+        widths = np.ones(logit.size + 1, dtype=float)
+    else:
+        widths = np.asarray(widths, dtype=float)
+    shift = logit - np.max(logit)
+    exp_terms = np.exp(shift)
+    denom = 1.0 + np.sum(exp_terms)
+    simplex = np.empty(logit.size + 1, dtype=float)
+    simplex[:-1] = exp_terms / denom
+    simplex[-1] = 1.0 / denom
+    clipped_widths = np.clip(widths, PDF_FLOOR, None)
+    density = simplex / clipped_widths
+    norm = np.sum(density * clipped_widths)
+    if not np.isfinite(norm) or norm <= 0.0:
+        norm = PDF_FLOOR * density.size
+    density /= norm
+    return density
 
 
 
 
 class EllipticalSliceSampler:
-    def __init__(self, prior_mean: np.ndarray,
-                 prior_cov: np.ndarray,
-                 loglik: Callable):
-        """
-        Initialize the Elliptical Slice Sampler.
+    def __init__(self, prior_mean: np.ndarray, prior_cov: np.ndarray):
+        """Elliptical slice sampler with reusable prior (Murray et al. 2010)."""
+        self.prior_mean = np.asarray(prior_mean, dtype=float)
+        self.prior_cov = np.asarray(prior_cov, dtype=float)
+        self._n = self.prior_mean.size
 
-        Parameters:
-        prior_mean (np.ndarray): Mean of the prior distribution.
-        prior_cov (np.ndarray): Covariance matrix of the prior distribution.
-        loglik (Callable): Log-likelihood function.
-        """
-        self.prior_mean = prior_mean
-        self.prior_cov = prior_cov
+        try:
+            self._chol = np.linalg.cholesky(self.prior_cov)
+        except LinAlgError:
+            jitter = np.eye(self._n) * 1.0e-8
+            self._chol = np.linalg.cholesky(self.prior_cov + jitter)
 
-        self.loglik = loglik
+    def step(self, current_state: np.ndarray, loglik: Callable[[np.ndarray], float]) -> np.ndarray:
+        """Draw a single sample given the current state and log-likelihood."""
+        current_state = np.asarray(current_state, dtype=float)
+        nu = self._chol @ np.random.randn(self._n)
+        log_y = loglik(current_state) + np.log(np.random.uniform())
+        theta = np.random.uniform(0.0, 2.0 * np.pi)
+        theta_min, theta_max = theta - 2.0 * np.pi, theta
+        mu = self.prior_mean
 
-        self._n = len(prior_mean)  # Dimensionality of the parameter space
-        self._chol = np.linalg.cholesky(prior_cov)  # Cholesky decomposition of the prior covariance matrix
+        while True:
+            proposal = (current_state - mu) * np.cos(theta) + nu * np.sin(theta) + mu
+            if loglik(proposal) > log_y:
+                return proposal
+            if theta < 0:
+                theta_min = theta
+            else:
+                theta_max = theta
+            theta = np.random.uniform(theta_min, theta_max)
 
-        # Initialize state with a sample from the prior distribution
-        self._state_f = self._chol @ np.random.randn(self._n) + prior_mean
-
-    def _indiv_sample(self):
-        """Main algorithm for generating individual samples."""
-        f = self._state_f  # previous cached state
-        nu = self._chol @ np.random.randn(self._n)  # choose ellipse using prior
-        log_y = self.loglik(f) + np.log(np.random.uniform())  # ll threshold
-        
-        theta = np.random.uniform(0., 2*np.pi)  # initial proposal
-        theta_min, theta_max = theta-2*np.pi, theta  # define bracket
-
-        # main loop:  accept sample on bracket, else shrink bracket and try again
-        while True:  
-            assert abs(theta) > 1e-10  # Use small epsilon instead of exact zero check
-            f_prime = (f - self.prior_mean)*np.cos(theta) + nu*np.sin(theta)
-            f_prime += self.prior_mean
-            if self.loglik(f_prime) > log_y:  # accept
-                self._state_f = f_prime
-                return
-            
-            else:  # shrink bracket and try new point
-                if theta < 0:
-                    theta_min = theta
-                else:
-                    theta_max = theta
-                theta = np.random.uniform(theta_min, theta_max)
-
-    def sample(self,
-               n_samples: int,
-               n_burn: int = 500) -> np.ndarray:
-        """
-        Generate samples from the posterior distribution.
-
-        Parameters:
-        n_samples (int): Number of samples to generate.
-        n_burn (int): Number of burn-in samples to discard. Default is 500.
-
-        Returns:
-        np.ndarray: Array of generated samples.
-        """
-        
-        samples = []
+    def sample(
+        self,
+        loglik: Callable[[np.ndarray], float],
+        initial_state: Optional[np.ndarray] = None,
+        n_samples: int = 1,
+        n_burn: int = 0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate samples, returning both the chain segment and the final state."""
+        if initial_state is None:
+            initial_state = self.prior_mean.copy()
+        state = np.asarray(initial_state, dtype=float)
+        collected = []
         for i in range(n_samples):
-            self._indiv_sample()
-            if i > n_burn: # Discard burn-in samples
-                samples.append(self._state_f.copy())
-
-        return np.stack(samples)
-    
-
-def convert_s_to_nz(s): 
-    """
-    Convert a vector of log-probability to probabilities using the softmax function.
-
-    Parameters:
-    s (array-like): Input array of log-probability.
-
-    Returns:
-    np.ndarray: Array of probabilities.
-    """
-    nz = np.array([np.exp(el)/np.sum(np.exp(s)) for el in s])
-    return nz
+            state = self.step(state, loglik)
+            if i >= n_burn:
+                collected.append(state.copy())
+        return np.array(collected), state
 
 
 class LogLike(object): 
@@ -120,22 +133,45 @@ class LogLike(object):
         mean_wx (array-like): Mean vector for the cluster redshift distribution.
         cov_wx (array-like): Covariance matrix for the cluster redshift distribution.
         """
-        self.zmid_wx = zmid_wx
-        self.mean_wx = mean_wx
-        self.cov_wx = cov_wx
+        self.zmid_wx = np.asarray(zmid_wx, dtype=float)
+        self.mean_wx = np.asarray(mean_wx, dtype=float)
+        self.cov_wx = np.asarray(cov_wx, dtype=float)
+
+        if len(self.zmid_wx) > 1:
+            midpoints = self.zmid_wx
+            edges = np.empty(midpoints.size + 1, dtype=float)
+            edges[1:-1] = 0.5 * (midpoints[:-1] + midpoints[1:])
+            delta_first = midpoints[1] - midpoints[0]
+            delta_last = midpoints[-1] - midpoints[-2]
+            edges[0] = midpoints[0] - 0.5 * delta_first
+            edges[-1] = midpoints[-1] + 0.5 * delta_last
+            self.bin_widths = np.diff(edges)
+        else:
+            self.bin_widths = np.ones_like(self.mean_wx)
         
-    def loglike_svec_given_amp(self, zmid, amp):
-        def loss(s_vec): 
-            s_vec_wx = InterpolatedUnivariateSpline(zmid,s_vec)(self.zmid_wx)
-            nz_relevant = convert_s_to_nz(s_vec_wx)
-            return multivariate_normal.logpdf(nz_relevant * amp, self.mean_wx, self.cov_wx) #+ multivariate_normal.logpdf(s_vec, self.mean_dnnz, self.cov_dnnz)
+    def _project_profile(self, zmid: np.ndarray, profile: np.ndarray) -> np.ndarray:
+        spline = InterpolatedUnivariateSpline(zmid, profile, k=1, ext=1)
+        return spline(self.zmid_wx)
+
+    def loglike_logit_given_amp(self, zmid: np.ndarray, amp: float) -> Callable[[np.ndarray], float]:
+        widths = compute_bin_widths(zmid)
+        def loss(logit_vec: np.ndarray) -> float:
+            probs = logit_to_pdf(logit_vec, widths)
+            prof_wx = self._project_profile(zmid, probs)
+            expected_counts = prof_wx * self.bin_widths * amp
+            return multivariate_normal.logpdf(expected_counts, self.mean_wx, self.cov_wx)
         return loss
-               
-    def loglike_amp_given_svec(self, zmid, s_vec): 
-        def loss(amp): 
-            s_vec_wx = InterpolatedUnivariateSpline(zmid,s_vec)(self.zmid_wx)
-            nz_relevant = convert_s_to_nz(s_vec_wx)
-            return multivariate_normal.logpdf(nz_relevant * amp, self.mean_wx, self.cov_wx)
+
+    def loglike_amp_given_logit(self, zmid: np.ndarray, logit_vec: np.ndarray) -> Callable[[float], float]:
+        widths = compute_bin_widths(zmid)
+        prof_wx = self._project_profile(zmid, logit_to_pdf(logit_vec, widths))
+        prof_counts = prof_wx * self.bin_widths
+
+        def loss(amp: float) -> float:
+            if amp <= 0.0:
+                return -np.inf
+            return multivariate_normal.logpdf(prof_counts * amp, self.mean_wx, self.cov_wx)
+
         return loss
 
 def convert_mids_to_breaks(mids): 
@@ -168,10 +204,12 @@ class LogisticGPSummarizer(PZSummarizer):
     """
     Logistic Gaussian Summarizer
     
-    The summarizer takes realizations of a photo-z point estimate qp ensemble, 
-    and the cluster redshift likelihood in the form of Gaussian distribution, 
-    perform logistic Gaussian Process and estimate the n(z) combining the two
-    information. 
+    Implements the composite likelihood methodology of Rau et al. (2021, 2022) by
+    combining photometric redshift ensemble information (approximated as a
+    logit-normal prior on the sample redshift distribution) with clustering
+    cross-correlation data modelled as Gaussian-distributed counts. Inference is
+    performed via joint sampling of the amplitude parameter and the latent
+    logit field using elliptical slice sampling.
     """
 
     name = "LogisticGPSummarizer"
@@ -181,7 +219,14 @@ class LogisticGPSummarizer(PZSummarizer):
         zmax=Param(float, 3.0, msg="The maximum redshift of the z grid"),
         nzbins=Param(int, 301, msg="The number of gridpoints in the z grid"),
         n_steps=Param(int, 5000, msg="N-steps for MCMC sampling"),
-        afterburner = Param(int, 2000, msg = 'Remove the samples before chain converge')
+        afterburner=Param(int, 2000, msg='Remove the samples before chain converge'),
+        amp_step=Param(float, 0.5, msg="RW proposal scale for the amplitude parameter"),
+        min_amp=Param(float, 1.0e-3, msg="Lower bound/initialisation for the amplitude parameter"),
+        initial_amp=Param(float, -1.0, msg="Optional user-specified amplitude start (<=0 uses data-driven start)"),
+        prior_jitter=Param(float, 1.0e-6, msg="Diagonal jitter added to the photometric prior covariance"),
+        progress_interval=Param(int, 500, msg="Print progress every N iterations (<=0 disables)"),
+        ess_n_samples=Param(int, 20, msg="Number of ESS proposals per joint iteration"),
+        ess_n_burn=Param(int, 10, msg="Number of burn-in ESS steps per joint iteration"),
         )
     inputs = [("input", QPHandle), ("model", ModelHandle)]
     outputs = [("output", QPHandle)]
@@ -222,46 +267,60 @@ class LogisticGPSummarizer(PZSummarizer):
         tuple: Arrays of sampled amplitudes and s_vecs.
         """
         loglike_model = LogLike(self.zmid_wx, self.signal_wx, self.cov_wx)
-        # TEENY = np.random.uniform(0,1e-16,len(self.zgrid_mid))
-        trace_amp = [50.0]
-        # Add small epsilon to avoid log(0) warnings
-        pdf_values = self.qp_output.pdf(self.zgrid_mid)
-        pdf_values = np.maximum(pdf_values, 1e-16)
-        
-        trace_svec = [np.log(pdf_values[0])]
 
-        log_pz = np.log(pdf_values)
-        mean_pz = np.mean(log_pz,axis = 0)
+        pdf_values = np.atleast_2d(self.qp_output.pdf(self.zgrid_mid))
+        pdf_values = np.clip(pdf_values, PDF_FLOOR, None)
 
-        cov_pz = np.cov(log_pz.T)
-        # Add regularization to ensure positive definiteness
-        cov_pz += np.eye(cov_pz.shape[0]) * 1e-6
+        normalisation = np.array([np.sum(p * self.zgrid_widths) for p in pdf_values])
+        pdf_normed = pdf_values / normalisation[:, None]
+
+        logit_samples = np.array([pdf_to_logit(p, self.zgrid_widths) for p in pdf_normed])
+        prior_mean = logit_samples.mean(axis=0)
+        if logit_samples.shape[0] < 2:
+            prior_cov = np.eye(prior_mean.size)
+        else:
+            prior_cov = np.cov(logit_samples, rowvar=False)
+        prior_cov += np.eye(prior_mean.size) * self.config.prior_jitter
+
+        sampler = EllipticalSliceSampler(prior_mean, prior_cov)
+
+        if self.config.initial_amp > 0:
+            initial_amp = self.config.initial_amp
+        else:
+            initial_amp = np.sum(self.signal_wx)
+        initial_amp = max(initial_amp, self.config.min_amp)
+        trace_amp = [initial_amp]
+        trace_logit = [prior_mean.copy()]
+
+        current_amp = initial_amp
+        current_logit = prior_mean.copy()
 
         for step in range(self.config.n_steps): 
-            #update amp 
-            if step%1000 == 0:
-                print("Step "+str(step))
-            loss_amp_given_svec = loglike_model.loglike_amp_given_svec(self.zgrid_mid,trace_svec[-1])
-            proposed_amp = np.random.normal(trace_amp[-1], 0.1)
+            if self.config.progress_interval > 0 and step % self.config.progress_interval == 0:
+                print(f"LogisticGP sampler step {step}")
 
-            log_new = loss_amp_given_svec(proposed_amp)
-            log_old = loss_amp_given_svec(trace_amp[-1])
-            log_accept_ratio = log_new - log_old
-            rnd_curr = np.log(np.random.uniform(low=0.0, high=1.0))
-            if log_accept_ratio > rnd_curr:
-                trace_amp.append(proposed_amp)
+            loss_amp = loglike_model.loglike_amp_given_logit(self.zgrid_mid, current_logit)
+            proposed_amp = np.random.normal(current_amp, self.config.amp_step)
+            if proposed_amp > self.config.min_amp:
+                log_accept_ratio = loss_amp(proposed_amp) - loss_amp(current_amp)
+                if log_accept_ratio > np.log(np.random.uniform(low=0.0, high=1.0)):
+                    current_amp = proposed_amp
+            trace_amp.append(current_amp)
+
+            loss_logit = loglike_model.loglike_logit_given_amp(self.zgrid_mid, current_amp)
+            ess_samples, current_logit = sampler.sample(
+                loss_logit,
+                initial_state=current_logit,
+                n_samples=self.config.ess_n_samples,
+                n_burn=self.config.ess_n_burn,
+            )
+            if ess_samples.size == 0:
+                trace_logit.append(current_logit.copy())
             else:
-                trace_amp.append(trace_amp[-1])
+                current_logit = ess_samples[-1]
+                trace_logit.append(current_logit.copy())
 
-            #update svec
-            
-            
-            
-            loss_svec_given_amp = loglike_model.loglike_svec_given_amp(self.zgrid_mid, trace_amp[-1])
-            sample_svec = EllipticalSliceSampler(mean_pz,cov_pz, loss_svec_given_amp)
-            
-            trace_svec.append(sample_svec.sample(20, 10)[-1])
-        return np.array(trace_amp), np.array(trace_svec)
+        return np.array(trace_amp), np.array(trace_logit)
 
     def run(self):
         """
@@ -272,14 +331,16 @@ class LogisticGPSummarizer(PZSummarizer):
         
         self.zgrid_breaks = np.linspace(self.config.zmin, self.config.zmax, self.config.nzbins)
         self.zgrid_mid = convert_breaks_to_mids(self.zgrid_breaks)
+        self.zgrid_widths = compute_bin_widths(self.zgrid_mid)
         
-        self.trace_amp0, self.trace_svec0 = self.sample_joint()
-        
-        self.trace_bin0 = np.column_stack((self.trace_amp0, self.trace_svec0))
-        
-        self.trace_nz0 = np.array([convert_s_to_nz(el) for el in self.trace_bin0[:, 1:]])
-        
-        nzs = qp.Ensemble(qp.interp, data=dict(xvals=self.zgrid_mid, yvals=self.trace_nz0[self.config.afterburner:]))
-        
+        self.trace_amp0, self.trace_logit0 = self.sample_joint()
+
+        self.trace_nz0 = np.array([logit_to_pdf(vec, self.zgrid_widths) for vec in self.trace_logit0])
+
+        burn = min(self.config.afterburner, len(self.trace_nz0) - 1)
+        posterior_samples = self.trace_nz0[burn:]
+
+        nzs = qp.Ensemble(qp.interp, data=dict(xvals=self.zgrid_mid, yvals=posterior_samples))
+
         self.add_data('output', nzs)
         
