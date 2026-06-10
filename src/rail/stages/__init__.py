@@ -8,7 +8,12 @@ from rail.creation.engine import Creator, Modeler, PosteriorCalculator
 from rail.creation.noisifier import Noisifier
 from rail.creation.selector import Selector
 from rail.estimation.algos.equal_count import EqualCountClassifier
+from rail.estimation.algos.log_gp import LogisticGPSummarizer
 from rail.estimation.algos.naive_stack import NaiveStackInformer, NaiveStackSummarizer
+from rail.estimation.algos.nz_prior import (
+    CosmicVarianceStackInformer,
+    CosmicVarianceStackSummarizer,
+)
 from rail.estimation.algos.point_est_hist import (
     PointEstHistInformer,
     PointEstHistSummarizer,
@@ -46,6 +51,9 @@ __all__ = [
     "TrainZEstimator",
     "VarInfStackInformer",
     "VarInfStackSummarizer",
+    "LogisticGPSummarizer",
+    "CosmicVarianceStackInformer",
+    "CosmicVarianceStackSummarizer",
     "UniformBinningClassifier",
     "EqualCountClassifier",
     "TrueNZHistogrammer",

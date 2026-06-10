@@ -6,16 +6,18 @@ Author: Markus Michael Rau, Tianqing Zhang
 """
 
 
+from typing import Any, Callable, Optional, Tuple
+
 import numpy as np
 import qp
 from ceci.config import StageParameter as Param
-from rail.estimation.summarizer import PZSummarizer
-from rail.core.data import QPHandle, ModelHandle
-
+from numpy.linalg import LinAlgError
 from scipy.interpolate import InterpolatedUnivariateSpline
 from scipy.stats import multivariate_normal
-from typing import Callable, Optional, Tuple
-from numpy.linalg import LinAlgError
+
+from rail.core.common_params import SharedParams
+from rail.core.data import ModelHandle, ModelLike, QPHandle
+from rail.estimation.summarizer import PZSummarizer
 
 
 PDF_FLOOR = 1.0e-12
@@ -201,25 +203,18 @@ def convert_breaks_to_mids(breaks):
 
 
 class LogisticGPSummarizer(PZSummarizer):
-    """
-    Logistic Gaussian Summarizer
-    
-    Implements the composite likelihood methodology of Rau et al. (2021, 2022) by
-    combining photometric redshift ensemble information (approximated as a
-    logit-normal prior on the sample redshift distribution) with clustering
-    cross-correlation data modelled as Gaussian-distributed counts. Inference is
-    performed via joint sampling of the amplitude parameter and the latent
-    logit field using elliptical slice sampling.
-    """
+    """Logistic Gaussian Process summarizer combining photo-z and clustering data."""
 
     name = "LogisticGPSummarizer"
+    entrypoint_function = "summarize"
+    interactive_function = "logistic_gp_summarizer"
     config_options = PZSummarizer.config_options.copy()
     config_options.update(
-        zmin=Param(float, 0.0, msg="The minimum redshift of the z grid"),
-        zmax=Param(float, 3.0, msg="The maximum redshift of the z grid"),
-        nzbins=Param(int, 301, msg="The number of gridpoints in the z grid"),
+        zmin=SharedParams.copy_param("zmin"),
+        zmax=SharedParams.copy_param("zmax"),
+        nzbins=SharedParams.copy_param("nzbins"),
         n_steps=Param(int, 5000, msg="N-steps for MCMC sampling"),
-        afterburner=Param(int, 2000, msg='Remove the samples before chain converge'),
+        afterburner=Param(int, 2000, msg="Remove the samples before chain converge"),
         amp_step=Param(float, 0.5, msg="RW proposal scale for the amplitude parameter"),
         min_amp=Param(float, 1.0e-3, msg="Lower bound/initialisation for the amplitude parameter"),
         initial_amp=Param(float, -1.0, msg="Optional user-specified amplitude start (<=0 uses data-driven start)"),
@@ -227,24 +222,30 @@ class LogisticGPSummarizer(PZSummarizer):
         progress_interval=Param(int, 500, msg="Print progress every N iterations (<=0 disables)"),
         ess_n_samples=Param(int, 20, msg="Number of ESS proposals per joint iteration"),
         ess_n_burn=Param(int, 10, msg="Number of burn-in ESS steps per joint iteration"),
-        )
-    inputs = [("input", QPHandle), ("model", ModelHandle)]
+    )
+    inputs = [("model", ModelHandle), ("input", QPHandle)]
     outputs = [("output", QPHandle)]
 
-    def __init__(self, args, **kwargs):
+    def __init__(self, args: Any, **kwargs: Any) -> None:
         super().__init__(args, **kwargs)
 
-    
-    def summarize(self, input_data, model):
-        """
-        Summarize the input data using the model.
+    def summarize(
+        self, input_data: qp.Ensemble, model: ModelLike, **kwargs
+    ) -> QPHandle:
+        """Summarize photo-z ensemble data using a clustering redshift likelihood model.
 
-        Parameters:
-        input_data: Input pz distributions from photo-z methods
-        model: Model containing cluster redshift information.
+        Parameters
+        ----------
+        input_data : qp.Ensemble
+            Per-galaxy p(z), and any ancillary data associated with it
+        model : ModelLike
+            Model containing cluster redshift information with keys
+            ``zmid_wx``, ``signal_wx``, and ``cov_wx``
 
-        Returns:
-        QPHandle: Handle to the output data.
+        Returns
+        -------
+        QPHandle
+            Ensemble with n(z), and any ancillary data
         """
         # read the model
         self.set_data("model", model)
@@ -322,10 +323,8 @@ class LogisticGPSummarizer(PZSummarizer):
 
         return np.array(trace_amp), np.array(trace_logit)
 
-    def run(self):
-        """
-        Execute the summarization process.
-        """
+    def run(self) -> None:
+        """Execute the summarization process."""
         input_data = self.get_data('input')
         self.qp_output = input_data
         

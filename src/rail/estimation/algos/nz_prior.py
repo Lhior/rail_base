@@ -6,18 +6,19 @@ redshift distribution of that ensemble.
 Author: Markus Michael Rau, Tianqing Zhang
 """
 
+from typing import Any
+
 import numpy as np
 import qp
 from ceci.config import StageParameter as Param
-from rail.estimation.summarizer import PZSummarizer
-from rail.estimation.informer import PzInformer
-from rail.core.data import QPHandle, TableHandle, ModelHandle, Hdf5Handle
-from rail.core.common_params import SHARED_PARAMS
-
-from scipy.stats import lognorm
 from scipy.interpolate import InterpolatedUnivariateSpline
 from scipy.optimize import minimize
-from scipy.stats import multivariate_normal, rv_histogram
+from scipy.stats import lognorm, multivariate_normal, rv_histogram
+
+from rail.core.common_params import SharedParams
+from rail.core.data import ModelHandle, ModelLike, QPHandle
+from rail.estimation.informer import CatInformer
+from rail.estimation.summarizer import PZSummarizer
 
 
 
@@ -61,27 +62,24 @@ def convert_breaks_to_mids(breaks):
     return mids
 
 
-class CosmicVarianceStackInformer(PzInformer):
-    """
-    Informer for the cosmic variance summarizer
-    The Informer is responsible for converting the training set
-    into a model that describes the cosmic variance of the training set.
-    """
+class CosmicVarianceStackInformer(CatInformer):
+    """Informer that parameterizes cosmic variance from a spectroscopic training set."""
 
     name = "CosmicVarianceStackInformer"
-    config_options = PzInformer.config_options.copy()
+    entrypoint_function = "inform"
+    interactive_function = "cosmic_variance_stack_informer"
+    config_options = CatInformer.config_options.copy()
     config_options.update(
-        zmin=Param(float, 0.0, msg="The minimum redshift of the z grid"),
-        zmax=Param(float, 3.0, msg="The maximum redshift of the z grid"),
-        nzbins=Param(int, 301, msg="The number of gridpoints in the z grid"),
-        varN_N_filename = Param(str, "varN_N_data.txt", msg="var N / N for the training set"),
-        redshift_col=SHARED_PARAMS,
-        )
-    inputs = [("input", TableHandle)]
-    outputs = [("model", ModelHandle)]
+        zmin=SharedParams.copy_param("zmin"),
+        zmax=SharedParams.copy_param("zmax"),
+        nzbins=SharedParams.copy_param("nzbins"),
+        redshift_col=SharedParams.copy_param("redshift_col"),
+        varN_N_filename=Param(
+            str, "varN_N_data.txt", msg="var N / N for the training set"
+        ),
+    )
 
-    def __init__(self, args, **kwargs):
-        
+    def __init__(self, args: Any, **kwargs: Any) -> None:
         super().__init__(args, **kwargs)
 
     def model_varN_overN(self, amp, gamma):
@@ -107,15 +105,20 @@ class CosmicVarianceStackInformer(PzInformer):
         amp, gamma = vec
         return np.sum((self.varN_overN - self.model_varN_overN(amp, gamma))**2)
 
-    def run(self):
-        # input_data = self.get_handle("input", allow_missing=True)
+    def validate(self) -> None:
+        """Check that required columns exist in the training data."""
+        self._get_stage_columns()
+        data = self.get_handle("input", allow_missing=True)
+        self._check_column_names(data, self.stage_columns)
 
-        try:
-            self.config.hdf5_groupname
-            input_data = self.get_data('input')[self.config.hdf5_groupname]
-        except Exception:
-            self.config.hdf5_groupname = None
-            input_data = self.get_data('input')
+    def _get_stage_columns(self) -> None:
+        self.stage_columns = [self.config.redshift_col]
+
+    def run(self) -> None:
+        if self.config.hdf5_groupname:
+            input_data = self.get_data("input")[self.config.hdf5_groupname]
+        else:  # pragma: no cover
+            input_data = self.get_data("input")
         # set the zgrid values
         self.zgrid_breaks = np.linspace(self.config.zmin, self.config.zmax, self.config.nzbins)
         self.zgrid_mid = convert_breaks_to_mids(self.zgrid_breaks)
@@ -151,25 +154,22 @@ class CosmicVarianceStackInformer(PzInformer):
 
 
 class CosmicVarianceStackSummarizer(PZSummarizer):
-    """
-    Cosmic Variance Included Summarizer
-    
-    The summarizer take a model that contained the cosmic variance information for the training set, 
-    the photometric catalog, and produce a n(z) distribution that include the cosmic variance. 
-    """
+    """Summarizer that applies cosmic variance to a photo-z point-estimate stack."""
 
     name = "CosmicVarianceStackSummarizer"
+    entrypoint_function = "summarize"
+    interactive_function = "cosmic_variance_stack_summarizer"
     config_options = PZSummarizer.config_options.copy()
     config_options.update(
-        zmin=Param(float, 0.0, msg="The minimum redshift of the z grid"),
-        zmax=Param(float, 3.0, msg="The maximum redshift of the z grid"),
-        nzbins=Param(int, 301, msg="The number of gridpoints in the z grid"),
-        ancil_type = Param(str, "zmean", msg="Type of point estimate used for histogram"),
-        )
-    inputs = [("input", QPHandle), ("model", ModelHandle)]
+        zmin=SharedParams.copy_param("zmin"),
+        zmax=SharedParams.copy_param("zmax"),
+        nzbins=SharedParams.copy_param("nzbins"),
+        ancil_type=Param(str, "zmean", msg="Type of point estimate used for histogram"),
+    )
+    inputs = [("model", ModelHandle), ("input", QPHandle)]
     outputs = [("output", QPHandle)]
 
-    def __init__(self, args, **kwargs):
+    def __init__(self, args: Any, **kwargs: Any) -> None:
         super().__init__(args, **kwargs)
 
     def rebin(self, breaks_new): 
@@ -207,10 +207,22 @@ class CosmicVarianceStackSummarizer(PZSummarizer):
         return pz, mu, np.diag(sig_2)
 
     
-    def summarize(self, input_data, model):
-        """
-        This overwrites the summarize method of the PZSummarizer
-        because this module needs to read the informer
+    def summarize(
+        self, input_data: qp.Ensemble, model: ModelLike, **kwargs
+    ) -> QPHandle:
+        """Summarize photo-z data using a cosmic-variance model from the informer.
+
+        Parameters
+        ----------
+        input_data : qp.Ensemble
+            Per-galaxy p(z), and any ancillary data associated with it
+        model : ModelLike
+            Model from `CosmicVarianceStackInformer` with cosmic variance parameters
+
+        Returns
+        -------
+        QPHandle
+            Ensemble with n(z), and any ancillary data
         """
         # read the model
         self.set_data("model", model)
@@ -227,8 +239,8 @@ class CosmicVarianceStackSummarizer(PZSummarizer):
         self.finalize()
         return self.get_handle("output")
     
-    def run(self):
-        input_data = self.get_data('input')
+    def run(self) -> None:
+        input_data = self.get_data("input")
         # get the point estimate of the photo-z method
         point_est = input_data.ancil[self.config.ancil_type]
         # bin the point estimate into thin tomographic bins
