@@ -7,9 +7,10 @@ from typing import Any, Generator
 import numpy as np
 import qp
 from ceci.config import StageParameter as Param
+import gc
 
 from rail.core.data import QPHandle, TableHandle, TableLike
-from rail.core.common_params import SharedParams
+from rail.core.common_params import SharedParams, TOMOGRAPHY_ALL, TOMOGRAPHY_NONE
 from rail.estimation.informer import PzInformer
 from rail.estimation.summarizer import PZSummarizer
 
@@ -64,7 +65,6 @@ class PointEstHistSummarizer(PZSummarizer):
         )
         assert self.zgrid is not None
         self.bincents = 0.5 * (self.zgrid[1:] + self.zgrid[:-1])
-        bootstrap_matrix = self._broadcast_bootstrap_matrix()
         # Initiallizing the histograms
         single_hist = np.zeros(self.config.nzbins)
         hist_vals = np.zeros((self.config.n_samples, self.config.nzbins))
@@ -73,9 +73,10 @@ class PointEstHistSummarizer(PZSummarizer):
         for s, e, test_data, mask in iterator:
             print(f"Process {self.rank} running estimator on chunk {s:,} - {e:,}")
             self._process_chunk(
-                s, e, test_data, mask, first, bootstrap_matrix, single_hist, hist_vals
+                s, e, test_data, mask, first, single_hist, hist_vals
             )
             first = False
+            gc.collect()
             del test_data
         if self.comm is not None:  # pragma: no cover
             hist_vals, single_hist = self._join_histograms(hist_vals, single_hist)
@@ -97,20 +98,19 @@ class PointEstHistSummarizer(PZSummarizer):
         test_data: qp.Ensemble,
         mask: np.ndarray,
         _first: bool,
-        bootstrap_matrix: np.ndarray,
         single_hist: np.ndarray,
         hist_vals: np.ndarray,
     ) -> None:
         assert self.zgrid is not None
         zb = test_data.ancil[self.config.point_estimate_key]
         single_hist += np.histogram(zb[mask], bins=self.zgrid)[0]
+        # get a new random seed for each chunk, but make it deterministic
+        # by using the chunk start index and the base seed together
+        rng = np.random.default_rng(seed=[self.config.seed, start])
         for i in range(self.config.n_samples):
-            bootstrap_indeces = bootstrap_matrix[:, i]
-            # Neither all of the bootstrap_draws are in this chunk nor the index starts at "start"
-            chunk_mask = (bootstrap_indeces >= start) & (bootstrap_indeces < end)
-            bootstrap_indeces = bootstrap_indeces[chunk_mask] - start
-            zarr = np.where(mask, zb, np.nan)[bootstrap_indeces]
-            hist_vals[i] += np.histogram(zarr, bins=self.zgrid)[0]
+            # poisson bootstrap - see naive_stack.py comment for details.
+            bootstrap_weights = rng.poisson(lam=1.0, size=zb.size)
+            hist_vals[i] += np.histogram(zb, weights=bootstrap_weights, bins=self.zgrid)[0]
 
 
 class PointEstHistMaskedSummarizer(PointEstHistSummarizer):
@@ -121,7 +121,7 @@ class PointEstHistMaskedSummarizer(PointEstHistSummarizer):
     interactive_function = "point_est_hist_masked_summarizer"
     config_options = PointEstHistSummarizer.config_options.copy()
     config_options.update(
-        selected_bin=Param(int, -1, msg="bin to use"),
+        selected_bin=Param(int, TOMOGRAPHY_NONE, msg=f"bin to use, or {TOMOGRAPHY_ALL} for all bins >=0 or {TOMOGRAPHY_NONE} for no masking")
     )
     inputs = [("input", QPHandle), ("tomography_bins", TableHandle)]
     outputs = [("output", QPHandle), ("single_NZ", QPHandle)]
@@ -129,9 +129,9 @@ class PointEstHistMaskedSummarizer(PointEstHistSummarizer):
     def _setup_iterator(self) -> Generator:
         selected_bin = self.config.selected_bin
         if self.config.tomography_bins in ["none", None]:
-            selected_bin = -1
+            selected_bin = TOMOGRAPHY_NONE
 
-        if selected_bin == -1:
+        if selected_bin == TOMOGRAPHY_NONE:
             itrs = [self.input_iterator("input")]
         else:
             itrs = [
@@ -149,7 +149,10 @@ class PointEstHistMaskedSummarizer(PointEstHistSummarizer):
                     pz_data = d
                     first = False
                 else:
-                    mask = d["class_id"] == self.config.selected_bin
+                    if selected_bin == TOMOGRAPHY_ALL:
+                        mask = d["class_id"] >= 0
+                    else:
+                        mask = d["class_id"] == selected_bin
             if mask is None:
                 mask = np.ones(
                     pz_data.npdf,  # pylint: disable=possibly-used-before-assignment

@@ -32,6 +32,24 @@ Bands:
       name: comcam_y
       a_env: 1.31
   - Band:
+      name: lsstcam_u
+      a_env: 4.78
+  - Band:
+      name: lsstcam_g
+      a_env: 3.65
+  - Band:
+      name: lsstcam_r
+      a_env: 2.70
+  - Band:
+      name: lsstcam_i
+      a_env: 2.06
+  - Band:
+      name: lsstcam_z
+      a_env: 1.58
+  - Band:
+      name: lsstcam_y
+      a_env: 1.31
+  - Band:
       name: DC2LSST_u
       a_env: 4.81
   - Band:
@@ -330,6 +348,9 @@ CatalogTags:
       mag_err_column_template: "{band}_gaap1p0MagErr"
       filter_template: "comcam_{band}"
       band_list: ['u', 'g', 'r', 'i', 'z', 'y']
+      zmax: 6.0
+      nzbins: 601
+      calculated_point_estimates: ['zmode', 'zbest']
       bands:
         u:
           mag_limit: 26.5
@@ -349,6 +370,46 @@ CatalogTags:
       mag_err_column_template: "{band}_gaap1p0MagErr"
       filter_template: "comcam_{band}"
       band_list: ['g', 'r', 'i', 'z']
+      bands:
+        g:
+          mag_limit: 27.8
+        r:
+          mag_limit: 27.1
+        i:
+          mag_limit: 26.7
+        z:
+          mag_limit: 25.8
+  - CatalogTag:
+      name: "lsstcam_gaap"
+      mag_column_template: "{band}_gaap1p0Mag"
+      mag_err_column_template: "{band}_gaap1p0MagErr"
+      filter_template: "comcam_{band}"
+      band_list: ['u', 'g', 'r', 'i', 'z', 'y']
+      zmax: 6.0
+      nzbins: 601
+      calculated_point_estimates: ['zmode', 'zbest']
+      bands:
+        u:
+          mag_limit: 26.5
+        g:
+          mag_limit: 27.8
+        r:
+          mag_limit: 27.1
+        i:
+          mag_limit: 26.7
+        z:
+          mag_limit: 25.8
+        y:
+          mag_limit: 24.6
+  - CatalogTag:
+      name: "lsstcam_gaap_4band"
+      mag_column_template: "{band}_gaap1p0Mag"
+      mag_err_column_template: "{band}_gaap1p0MagErr"
+      filter_template: "comcam_{band}"
+      band_list: ['g', 'r', 'i', 'z']
+      zmax: 6.0
+      nzbins: 601
+      calculated_point_estimates: ['zmode', 'zbest']
       bands:
         g:
           mag_limit: 27.8
@@ -555,3 +616,42 @@ CatalogTags:
           mag_limit: 23.1
         z:
           mag_limit: 21.7
+  - CatalogTag:
+      name: "flagship"
+      mag_column_template: "mag_{band}_lsst"
+      mag_err_column_template: "mag_{band}_lsst_err"
+      filter_template: "DC2LSST_{band}"
+      band_list: ['u', 'g', 'r', 'i', 'z', 'y', 'Y', 'J', 'H', 'vis']
+      bands:
+        u:
+          mag_limit: 26.4
+        g:
+          mag_limit: 27.8
+        r:
+          mag_limit: 27.1
+        i:
+          mag_limit: 26.7
+        z:
+          mag_limit: 25.8
+        y:
+          mag_limit: 24.6
+        Y:
+          filter: euclid_Y
+          mag_column_name: "mag_y_euclid_nisp"
+          mag_err_column_name: "mag_y_euclid_nisp_err"
+          mag_limit: 26.0
+        J:
+          filter: euclid_J
+          mag_column_name: "mag_j_euclid_nisp"
+          mag_err_column_name: "mag_j_euclid_nisp_err"
+          mag_limit: 26.0
+        H:
+          filter: euclid_H
+          mag_column_name: "mag_h_euclid_nisp"
+          mag_err_column_name: "mag_h_euclid_nisp_err"
+          mag_limit: 26.0
+        vis:
+          filter: euclid_vis
+          mag_column_name: "mag_vis_euclid"
+          mag_err_column_name: "mag_vis_euclid_err"
+          mag_limit: 26.0

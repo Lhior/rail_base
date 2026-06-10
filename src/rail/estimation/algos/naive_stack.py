@@ -7,9 +7,10 @@ from typing import Any, Generator
 import numpy as np
 import qp
 from ceci.config import StageParameter as Param
+import gc
 
 from rail.core.data import QPHandle, TableHandle, TableLike
-from rail.core.common_params import SharedParams
+from rail.core.common_params import SharedParams, TOMOGRAPHY_ALL, TOMOGRAPHY_NONE
 from rail.estimation.informer import PzInformer
 from rail.estimation.summarizer import PZSummarizer
 
@@ -92,14 +93,14 @@ class NaiveStackSummarizer(PZSummarizer):
         # Initializing the stacking pdf's
         yvals = np.zeros((1, len(self.zgrid)))
         bvals = np.zeros((self.config.n_samples, len(self.zgrid)))
-        bootstrap_matrix = self._broadcast_bootstrap_matrix()
 
         first = True
         for s, e, test_data, mask in iterator:
             print(f"Process {self.rank} running estimator on chunk {s:,} - {e:,}")
             self._process_chunk(
-                s, e, test_data, mask, first, bootstrap_matrix, yvals, bvals
+                s, e, test_data, mask, first, yvals, bvals
             )
+            gc.collect()
             first = False
         if self.comm is not None:  # pragma: no cover
             bvals, yvals = self._join_histograms(bvals, yvals)
@@ -119,7 +120,6 @@ class NaiveStackSummarizer(PZSummarizer):
         data: qp.Ensemble,
         mask: np.ndarray,
         _first: bool,
-        bootstrap_matrix: np.ndarray,
         yvals: np.ndarray,
         bvals: np.ndarray,
     ) -> None:
@@ -136,13 +136,14 @@ class NaiveStackSummarizer(PZSummarizer):
             0,
         )
         # qp_d is the normalized probability of the stack, we need to know how many galaxies were
+        rng = np.random.default_rng(seed=[self.config.seed, start])
         for i in range(self.config.n_samples):
-            bootstrap_draws = bootstrap_matrix[:, i]
-            # Neither all of the bootstrap_draws are in this chunk nor the index starts at "start"
-            chunk_mask = (bootstrap_draws >= start) & (bootstrap_draws < end)
-            bootstrap_draws = bootstrap_draws[chunk_mask] - start
-            zarr = np.where(squeeze_mask, pdf_vals.T, 0.0).T[bootstrap_draws]
-            bvals[i] += np.sum(zarr, axis=0)
+            # This is Poisson bootstrap, a variant of regular bootstrap
+            # that does not require anything to be stored or comunicated between
+            # processes. For large numbers of objects this converges to the same
+            # distribution as regular bootstrap.
+            bootstrap_weights = rng.poisson(lam=1.0, size=pdf_vals.shape[0])
+            bvals[i] += bootstrap_weights[squeeze_mask] @ pdf_vals[squeeze_mask]
 
 
 class NaiveStackMaskedSummarizer(NaiveStackSummarizer):
@@ -151,7 +152,7 @@ class NaiveStackMaskedSummarizer(NaiveStackSummarizer):
     interactive_function = "naive_stack_masked_summarizer"
     config_options = NaiveStackSummarizer.config_options.copy()
     config_options.update(
-        selected_bin=Param(int, -1, msg="bin to use"),
+        selected_bin=Param(int, TOMOGRAPHY_NONE, msg=f"bin to use, or {TOMOGRAPHY_ALL} for all bins >=0 or {TOMOGRAPHY_NONE} for no masking"),
     )
     inputs = [("input", QPHandle), ("tomography_bins", TableHandle)]
     outputs = [("output", QPHandle), ("single_NZ", QPHandle)]
@@ -159,9 +160,9 @@ class NaiveStackMaskedSummarizer(NaiveStackSummarizer):
     def _setup_iterator(self) -> Generator:
         selected_bin = self.config.selected_bin
         if self.config.tomography_bins in ["none", None]:
-            selected_bin = -1
+            selected_bin = TOMOGRAPHY_NONE
 
-        if selected_bin == -1:
+        if selected_bin == TOMOGRAPHY_NONE:
             itrs = [self.input_iterator("input")]
         else:
             itrs = [
@@ -179,7 +180,10 @@ class NaiveStackMaskedSummarizer(NaiveStackSummarizer):
                     pz_data = d
                     first = False
                 else:
-                    mask = d["class_id"] == self.config.selected_bin
+                    if selected_bin == TOMOGRAPHY_ALL:
+                        mask = d["class_id"] >= 0
+                    else:
+                        mask = d["class_id"] == selected_bin
             if mask is None:
                 mask = np.ones(
                     pz_data.npdf,  # pylint: disable=possibly-used-before-assignment
